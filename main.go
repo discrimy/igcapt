@@ -1,11 +1,16 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
@@ -23,7 +28,7 @@ const (
 	VK_SHIFT   = 0x10
 
 	INPUT_KEYBOARD  = 1
-	KEYEVENTF_KEYUP = 0x0002
+	KEYEVENTF_KEYUP = 0x00000002
 
 	VK_CONTROL = 0x11
 	VK_MENU    = 0x12 // Alt
@@ -73,7 +78,15 @@ const (
 	CMD_MODE_CTRLSHIFT = 1101
 	CMD_MODE_ALTSHIFT  = 1102
 	CMD_MODE_WINSPACE  = 1103
-	CMD_EXIT           = 1201
+
+	CMD_TOGGLE_STARTUP = 1150
+
+	CMD_EXIT = 1201
+)
+
+const (
+	taskName     = "igcapt"
+	runValueName = "igcapt" // HKCU\...\Run value name
 )
 
 type SwitchMode int
@@ -190,6 +203,8 @@ var (
 	procShell_NotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 
 	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
+
+	procMessageBoxW = user32.NewProc("MessageBoxW")
 )
 
 var (
@@ -198,11 +213,22 @@ var (
 	enabled    = true
 	switchMode = ModeAltShift
 
+	startWithWindows = false
+
 	menuRoot windows.Handle
 	menuMode windows.Handle
 )
 
 func wstr(s string) *uint16 { p, _ := windows.UTF16PtrFromString(s); return p }
+
+func messageBox(title, text string) {
+	procMessageBoxW.Call(
+		0,
+		uintptr(unsafe.Pointer(wstr(text))),
+		uintptr(unsafe.Pointer(wstr(title))),
+		0,
+	)
+}
 
 func isShiftDown() bool {
 	r, _, _ := procGetAsyncKeyState.Call(uintptr(VK_SHIFT))
@@ -316,6 +342,138 @@ func removeTrayIcon() {
 	_, _, _ = procShell_NotifyIconW.Call(uintptr(NIM_DELETE), uintptr(unsafe.Pointer(&nid)))
 }
 
+// --------- Startup (Task Scheduler + HKCU Run fallback) ---------
+
+func exePath() (string, error) { return os.Executable() }
+
+func schtasks(args ...string) (string, error) {
+	cmd := exec.Command("schtasks.exe", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func isTaskEnabled() bool {
+	_, err := schtasks("/Query", "/TN", taskName)
+	return err == nil
+}
+
+func enableTask() error {
+	p, err := exePath()
+	if err != nil {
+		return err
+	}
+	tr := `"` + p + `"`
+	out, err := schtasks(
+		"/Create",
+		"/TN", taskName,
+		"/SC", "ONLOGON",
+		"/RL", "LIMITED",
+		"/TR", tr,
+		"/F",
+	)
+	if err != nil {
+		// propagate detailed output in error text
+		return errors.New(strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func disableTask() error {
+	out, err := schtasks("/Delete", "/TN", taskName, "/F")
+	if err != nil {
+		return errors.New(strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func isRunKeyEnabled() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	_, _, err = k.GetStringValue(runValueName)
+	return err == nil
+}
+
+func enableRunKey() error {
+	p, err := exePath()
+	if err != nil {
+		return err
+	}
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	val := `"` + p + `"`
+	return k.SetStringValue(runValueName, val)
+}
+
+func disableRunKey() error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	if err != nil {
+		// If key cannot be opened, treat as already disabled
+		return nil
+	}
+	defer k.Close()
+	_ = k.DeleteValue(runValueName)
+	return nil
+}
+
+func getStartupState() bool {
+	return isTaskEnabled() || isRunKeyEnabled()
+}
+
+// Enables startup: try Task Scheduler first; on access denied, fallback to HKCU Run.
+func enableStartup() (method string, err error) {
+	if err := enableTask(); err == nil {
+		return "Task Scheduler", nil
+	} else {
+		// If task creation denied, fallback to HKCU Run
+		// (Common in locked-down environments)
+		if err2 := enableRunKey(); err2 == nil {
+			return "HKCU Run", nil
+		} else {
+			// Return both errors
+			return "", errors.New("Task Scheduler failed:\n" + err.Error() + "\n\nHKCU Run failed:\n" + err2.Error())
+		}
+	}
+}
+
+func disableStartup() (method string, err error) {
+	// Remove both to be safe
+	var errs []string
+
+	if isTaskEnabled() {
+		if e := disableTask(); e != nil {
+			errs = append(errs, "Task Scheduler:\n"+e.Error())
+		} else {
+			method = "Task Scheduler"
+		}
+	}
+	if isRunKeyEnabled() {
+		if e := disableRunKey(); e != nil {
+			errs = append(errs, "HKCU Run:\n"+e.Error())
+		} else if method == "" {
+			method = "HKCU Run"
+		} else {
+			method = method + " + HKCU Run"
+		}
+	}
+
+	if len(errs) > 0 {
+		return method, errors.New(strings.Join(errs, "\n\n"))
+	}
+	if method == "" {
+		method = "None"
+	}
+	return method, nil
+}
+
+// ---------------- Menus ----------------
+
 func buildMenus() {
 	// Root popup
 	h, _, _ := procCreatePopupMenu.Call()
@@ -332,6 +490,8 @@ func buildMenus() {
 	_ = appendMenu(menuRoot, MF_STRING, CMD_TOGGLE_ENABLED, "Enabled")
 	_ = appendMenu(menuRoot, MF_SEPARATOR, 0, "")
 	_ = appendMenuPopup(menuRoot, menuMode, "Mode")
+	_ = appendMenu(menuRoot, MF_SEPARATOR, 0, "")
+	_ = appendMenu(menuRoot, MF_STRING, CMD_TOGGLE_STARTUP, "Start with Windows")
 	_ = appendMenu(menuRoot, MF_SEPARATOR, 0, "")
 	_ = appendMenu(menuRoot, MF_STRING, CMD_EXIT, "Exit")
 
@@ -377,6 +537,8 @@ func updateMenuChecks() {
 	checkMenuItem(menuMode, CMD_MODE_CTRLSHIFT, switchMode == ModeCtrlShift)
 	checkMenuItem(menuMode, CMD_MODE_ALTSHIFT, switchMode == ModeAltShift)
 	checkMenuItem(menuMode, CMD_MODE_WINSPACE, switchMode == ModeWinSpace)
+
+	checkMenuItem(menuRoot, CMD_TOGGLE_STARTUP, startWithWindows)
 }
 
 func showTrayMenu() {
@@ -414,6 +576,26 @@ func handleCommand(cmd uint32) {
 		updateMenuChecks()
 	case CMD_MODE_WINSPACE:
 		switchMode = ModeWinSpace
+		updateMenuChecks()
+
+	case CMD_TOGGLE_STARTUP:
+		if startWithWindows {
+			method, err := disableStartup()
+			if err != nil {
+				messageBox("igcapt - Disable startup failed", err.Error())
+			} else {
+				_ = method
+			}
+		} else {
+			method, err := enableStartup()
+			if err != nil {
+				messageBox("igcapt - Enable startup failed", err.Error())
+			} else {
+				// Optional: show which method was used
+				_ = method
+			}
+		}
+		startWithWindows = getStartupState()
 		updateMenuChecks()
 
 	case CMD_EXIT:
@@ -459,7 +641,7 @@ var wndProc = syscall.NewCallback(func(hWnd uintptr, msg uint32, wParam uintptr,
 
 func createHiddenWindow() error {
 	hMod, _, _ := procGetModuleHandleW.Call(0)
-	className := wstr("CapsLangSwitchTrayClass")
+	className := wstr("igcaptTrayClass")
 
 	// Register window class
 	hCursor, _, _ := procLoadCursorW.Call(0, uintptr(IDC_ARROW))
@@ -476,8 +658,6 @@ func createHiddenWindow() error {
 
 	r, _, err := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 	if r == 0 {
-		// If already registered, Windows returns 0 with ERROR_CLASS_ALREADY_EXISTS sometimes.
-		// For simplicity we ignore that case; CreateWindowExW will still work.
 		_ = err
 	}
 
@@ -485,7 +665,7 @@ func createHiddenWindow() error {
 	h, _, err2 := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(wstr("CapsLangSwitch"))),
+		uintptr(unsafe.Pointer(wstr("igcapt"))),
 		0,
 		uintptr(CW_USEDEFAULT), uintptr(CW_USEDEFAULT),
 		uintptr(CW_USEDEFAULT), uintptr(CW_USEDEFAULT),
@@ -530,6 +710,9 @@ func messageLoop() {
 
 func main() {
 	runtime.LockOSThread()
+
+	// Detect startup state before menu checks
+	startWithWindows = getStartupState()
 
 	if err := createHiddenWindow(); err != nil {
 		panic(err)
